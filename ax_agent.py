@@ -1,24 +1,3 @@
-"""
-Milestone 1 — Accessibility API Perception & Control
-------------------------------------------------------
-Reads structured UI element data from the frontmost macOS app,
-and provides functions to click/focus/type into elements.
-
-Run this ON YOUR MAC (not in a sandbox) — it needs pyobjc and
-macOS Accessibility permissions.
-
-Setup:
-    pip install pyobjc-framework-ApplicationServices pyobjc-framework-Quartz
-
-Then grant Accessibility permission:
-    System Settings -> Privacy & Security -> Accessibility
-    -> add Terminal (or your IDE / Python interpreter) and enable it.
-
-Usage:
-    python ax_agent.py                 # dumps UI tree of frontmost app
-    python ax_agent.py --app "Notes"   # dumps UI tree of a named app
-"""
-
 import sys
 import argparse
 from ApplicationServices import (
