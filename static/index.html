@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>Hey Lucifer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        background: #0b0b0f;
+        color: #eee;
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+        min-height: 100vh;
+        box-sizing: border-box;
+      }
+      h1 {
+        font-size: 20px;
+        font-weight: 600;
+        margin: 0;
+        text-align: center;
+        color: #ff5c5c;
+      }
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        min-height: 80px;
+        background: #1a1a20;
+        color: #eee;
+        border: 1px solid #333;
+        border-radius: 12px;
+        padding: 12px;
+        font-size: 16px;
+        resize: vertical;
+      }
+      button {
+        border: none;
+        border-radius: 14px;
+        padding: 16px;
+        font-size: 17px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #send-btn {
+        background: #ff5c5c;
+        color: white;
+      }
+      #send-btn:disabled {
+        opacity: 0.5;
+      }
+      #talk-btn {
+        background: #1a1a20;
+        color: #eee;
+        border: 1px solid #444;
+        padding: 28px;
+        font-size: 18px;
+        touch-action: manipulation;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      #talk-btn.recording {
+        background: #ff5c5c;
+        color: white;
+      }
+      #status {
+        text-align: center;
+        font-size: 14px;
+        color: #888;
+        min-height: 20px;
+      }
+      #log {
+        background: #14141a;
+        border-radius: 12px;
+        padding: 14px;
+        font-size: 14px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        flex: 1;
+        overflow-y: auto;
+        min-height: 120px;
+      }
+      .heard {
+        color: #7fd1ff;
+      }
+      .result {
+        color: #9fff9f;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🔥 Hey Lucifer</h1>
+
+    <textarea id="text-input" placeholder="Type a command..."></textarea>
+    <button id="send-btn">Send</button>
+
+    <button id="talk-btn">🎤 Hold to talk</button>
+    <div id="status"></div>
+
+    <div id="log"></div>
+
+    <script>
+      const log = document.getElementById("log");
+      const status = document.getElementById("status");
+
+      function addEntry(heard, result) {
+        const div = document.createElement("div");
+        div.innerHTML = `<div class="heard">You: ${heard}</div><div class="result">${result}</div><br>`;
+        log.appendChild(div);
+        log.scrollTop = log.scrollHeight;
+      }
+
+      // --- Text command ---
+      const sendBtn = document.getElementById("send-btn");
+      const textInput = document.getElementById("text-input");
+
+      sendBtn.onclick = async () => {
+        const text = textInput.value.trim();
+        if (!text) return;
+        sendBtn.disabled = true;
+        status.textContent = "Working...";
+        try {
+          const formData = new FormData();
+          formData.append("text", text);
+          const res = await fetch("/command/text", {
+            method: "POST",
+            body: formData,
+          });
+          const data = await res.json();
+          addEntry(data.heard, data.result);
+          textInput.value = "";
+        } catch (e) {
+          status.textContent = "Error: " + e.message;
+        } finally {
+          sendBtn.disabled = false;
+          status.textContent = "";
+        }
+      };
+
+      // --- Voice command (hold to talk) ---
+      const talkBtn = document.getElementById("talk-btn");
+      let mediaRecorder,
+        chunks = [];
+
+      async function startRecording() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        mediaRecorder = new MediaRecorder(stream);
+        chunks = [];
+        mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+        mediaRecorder.onstop = sendRecording;
+        mediaRecorder.start();
+        talkBtn.classList.add("recording");
+        talkBtn.textContent = "🔴 Recording... release to send";
+      }
+
+      function stopRecording() {
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+          mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+        }
+        talkBtn.classList.remove("recording");
+        talkBtn.textContent = "🎤 Hold to talk";
+      }
+
+      async function sendRecording() {
+        const blob = new Blob(chunks, { type: "audio/webm" });
+        status.textContent = "Transcribing & working...";
+        try {
+          const formData = new FormData();
+          formData.append("audio", blob, "command.webm");
+          const res = await fetch("/command/voice", {
+            method: "POST",
+            body: formData,
+          });
+          const data = await res.json();
+          addEntry(data.heard || "(nothing heard)", data.result);
+        } catch (e) {
+          status.textContent = "Error: " + e.message;
+        } finally {
+          status.textContent = "";
+        }
+      }
+
+      talkBtn.addEventListener("touchstart", (e) => {
+        e.preventDefault();
+        startRecording();
+      });
+      talkBtn.addEventListener("touchend", (e) => {
+        e.preventDefault();
+        stopRecording();
+      });
+      talkBtn.addEventListener("mousedown", startRecording);
+      talkBtn.addEventListener("mouseup", stopRecording);
+    </script>
+  </body>
+</html>
