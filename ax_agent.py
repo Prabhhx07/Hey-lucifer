@@ -1,5 +1,29 @@
+"""
+Milestone 1 — Accessibility API Perception & Control
+------------------------------------------------------
+Reads structured UI element data from a macOS app, and provides functions
+to click/focus/type into elements.
+
+Run this ON YOUR MAC (not in a sandbox) — it needs pyobjc and macOS
+Accessibility permissions.
+
+Setup:
+    pip install pyobjc-framework-ApplicationServices pyobjc-framework-Quartz
+
+Then grant Accessibility permission:
+    System Settings -> Privacy & Security -> Accessibility
+    -> add Terminal (or your IDE / Python interpreter) and enable it.
+
+Usage:
+    python ax_agent.py                 # dumps UI tree of frontmost app
+    python ax_agent.py --app "Notes"   # dumps UI tree of a named app
+"""
+
 import sys
+import time
 import argparse
+import subprocess
+
 from ApplicationServices import (
     AXUIElementCreateApplication,
     AXUIElementCreateSystemWide,
@@ -7,23 +31,25 @@ from ApplicationServices import (
     AXUIElementCopyAttributeNames,
     AXUIElementPerformAction,
     AXUIElementSetAttributeValue,
-    AXValueGetValue,
-    kAXValueCGPointType,
-    kAXValueCGSizeType,
     kAXErrorSuccess,
 )
-from AppKit import NSWorkspace, NSRunningApplication, NSApplicationActivateIgnoringOtherApps
+from AppKit import (
+    NSWorkspace,
+    NSRunningApplication,
+    NSApplicationActivateIgnoringOtherApps,
+)
 from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventKeyboardSetUnicodeString,
     CGEventCreateMouseEvent,
     CGEventPost,
+    CGEventSetFlags,
     kCGHIDEventTap,
     kCGEventLeftMouseDown,
     kCGEventLeftMouseUp,
     kCGMouseButtonLeft,
+    kCGEventFlagMaskCommand,
 )
-import time
 
 # Attributes we care about when describing an element
 INTERESTING_ATTRS = [
@@ -61,6 +87,10 @@ INTERESTING_ROLES = {
     "AXToolbar",
     "AXSlider",
 }
+
+# Virtual keycodes (US layout) used for the select-all + delete sequence.
+_VK_A = 0
+_VK_DELETE = 51
 
 
 def get_frontmost_pid():
@@ -101,8 +131,9 @@ def describe_element(element):
 def walk(element, depth=0, max_depth=MAX_DEPTH, path=""):
     """
     Recursively walk the accessibility tree, yielding (path, description, element)
-    for each node. `path` is a simple index-based path you can use later to
-    re-locate an element after a fresh perception pass.
+    for each node. `path` is a simple index-based path -- treat it as valid only
+    for the walk that produced it; always re-walk fresh before acting, since
+    paths go stale the moment the UI state changes.
     """
     if depth > max_depth:
         return
@@ -136,12 +167,44 @@ def get_main_window(app_element):
     return windows[0] if windows else None
 
 
+def ensure_window_open(pid, app_name):
+    """
+    Check whether the app currently has a window before starting a task.
+    Some apps (Notes included) can genuinely report zero windows while
+    still running -- if so, attempt Cmd+N to open one. Without this
+    upfront check, perception can start against an empty/near-empty
+    element list with nothing meaningful to act on.
+    """
+    app_element = AXUIElementCreateApplication(pid)
+    window = get_main_window(app_element)
+    if window is not None:
+        return True
+
+    print(f"{app_name} has no open window. Attempting Cmd+N to open one...")
+    activate_app(pid)
+    time.sleep(0.4)
+    subprocess.run([
+        "osascript", "-e",
+        'tell application "System Events" to keystroke "n" using command down'
+    ])
+    time.sleep(1.0)
+
+    app_element = AXUIElementCreateApplication(pid)
+    window = get_main_window(app_element)
+    if window is None:
+        print(f"Still no window after Cmd+N -- {app_name} may need manual attention.")
+        return False
+
+    print("Window opened successfully.")
+    return True
+
+
 def dump_ui_tree(pid, app_name, filter_roles=True):
     app_element = AXUIElementCreateApplication(pid)
     window = get_main_window(app_element)
 
     if window is None:
-        print(f"\nNo window found for {app_name} (pid {pid}) — "
+        print(f"\nNo window found for {app_name} (pid {pid}) -- "
               f"is the app actually showing a window? Falling back to full app tree.\n")
         root = app_element
     else:
@@ -169,7 +232,9 @@ def dump_ui_tree(pid, app_name, filter_roles=True):
 
 
 def find_element_by_path(pid, path):
-    """Re-locate an element using the path produced by walk()."""
+    """Re-locate an element using the path produced by walk(). Only valid
+    against the same tree state the path came from -- prefer find_first_by_role
+    for anything after the UI may have changed."""
     app_element = AXUIElementCreateApplication(pid)
     if path == "":
         return app_element
@@ -179,15 +244,61 @@ def find_element_by_path(pid, path):
     return None
 
 
+def find_first_by_role(pid, role, window=None):
+    """
+    Walk the app's current tree fresh and return the first element matching
+    `role` (e.g. 'AXTextArea'). Always re-walk immediately before acting --
+    cached paths from an earlier walk go stale as soon as the UI state
+    changes (e.g. a different list item gets selected), since paths are
+    positional indices, not stable IDs.
+    """
+    app_element = AXUIElementCreateApplication(pid)
+    root = window if window is not None else (get_main_window(app_element) or app_element)
+    for path, desc, element in walk(root):
+        if desc.get("AXRole") == role:
+            return path, element
+    return None, None
+
+
 def click_element(element):
     """Perform the default 'press' action on an element (button, menu item, etc.)."""
     err = AXUIElementPerformAction(element, "AXPress")
     return err == kAXErrorSuccess
 
 
+def type_into_element(element, text):
+    """Set the AXValue of a text field / text area directly (fast, but
+    many Cocoa/SwiftUI text views silently ignore this -- always verify
+    the result by re-reading AXValue, or prefer type_into_element_reliable()."""
+    err = AXUIElementSetAttributeValue(element, "AXValue", text)
+    return err == kAXErrorSuccess
+
+
+def focus_element(element):
+    """Set AXFocused on an element so subsequent keystrokes land in it."""
+    err = AXUIElementSetAttributeValue(element, "AXFocused", True)
+    return err == kAXErrorSuccess
+
+
+def activate_app(pid):
+    """
+    Bring the target app to the actual OS foreground. This is separate
+    from -- and required in addition to -- focus_element()'s AXFocused
+    attribute: AXFocused only sets accessibility focus *within* the app,
+    but CGEventPost keystrokes go to whatever app is frontmost at the OS
+    level. Skipping this step is how keystrokes end up typed into the
+    wrong window (e.g. your terminal) even when AXFocused succeeded.
+    """
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if app is None:
+        print(f"Warning: could not find running app for pid {pid}")
+        return False
+    return app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+
+
 def click_at_point(x, y):
     """Simulate a real left mouse click at absolute screen coordinates.
-    More reliable than AXFocused for establishing genuine input focus —
+    More reliable than AXFocused for establishing genuine input focus --
     some apps (Notes among them) accept real clicks but silently ignore
     the AXFocused accessibility attribute."""
     down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (x, y), kCGMouseButtonLeft)
@@ -199,27 +310,19 @@ def click_at_point(x, y):
 
 def get_element_center(element):
     """Return the (x, y) screen center of an element, or None if position/size
-    attributes aren't available.
-
-    AXPosition/AXSize come back from the Accessibility API as opaque
-    AXValueRef-wrapped structs (CGPoint/CGSize), not plain objects with
-    .x/.y — they must be explicitly decoded with AXValueGetValue.
-    """
-    pos_ref = get_attr(element, "AXPosition")
-    size_ref = get_attr(element, "AXSize")
-    if pos_ref is None or size_ref is None:
+    attributes aren't available."""
+    pos = get_attr(element, "AXPosition")
+    size = get_attr(element, "AXSize")
+    if pos is None or size is None:
         return None
-
-    ok, point = AXValueGetValue(pos_ref, kAXValueCGPointType, None)
-    if not ok:
+    # AXPosition/AXSize come back as AXValue-wrapped CGPoint/CGSize structs;
+    # pyobjc exposes them with .x/.y and .width/.height.
+    try:
+        x = pos.x + size.width / 2
+        y = pos.y + size.height / 2
+        return (x, y)
+    except AttributeError:
         return None
-    ok, size = AXValueGetValue(size_ref, kAXValueCGSizeType, None)
-    if not ok:
-        return None
-
-    x = point.x + size.width / 2
-    y = point.y + size.height / 2
-    return (x, y)
 
 
 def click_element_directly(element):
@@ -227,37 +330,10 @@ def click_element_directly(element):
     of focus_element() for apps that ignore programmatic AXFocused writes."""
     center = get_element_center(element)
     if center is None:
-        print("Warning: could not determine element position — cannot click.")
+        print("Warning: could not determine element position -- cannot click.")
         return False
     click_at_point(*center)
     return True
-
-
-def find_first_by_role(pid, role, window=None):
-    """
-    Walk the app's current tree fresh and return the first element matching
-    `role` (e.g. 'AXTextArea'). Always re-walk immediately before acting —
-    cached paths from an earlier walk go stale as soon as the UI state
-    changes (e.g. a different list item gets selected), since paths are
-    positional indices, not stable IDs.
-    """
-    app_element = AXUIElementCreateApplication(pid)
-    root = window if window is not None else (get_main_window(app_element) or app_element)
-    for path, desc, element in walk(root):
-        if desc.get("AXRole") == role:
-            return path, element
-    return None, None
-    """Set the AXValue of a text field / text area directly (fast, but
-    many Cocoa/SwiftUI text views silently ignore this — always verify
-    the result by re-reading AXValue, or prefer type_via_keystrokes()."""
-    err = AXUIElementSetAttributeValue(element, "AXValue", text)
-    return err == kAXErrorSuccess
-
-
-def focus_element(element):
-    """Set AXFocused on an element so subsequent keystrokes land in it."""
-    err = AXUIElementSetAttributeValue(element, "AXFocused", True)
-    return err == kAXErrorSuccess
 
 
 def type_via_keystrokes(text, delay=0.005):
@@ -267,9 +343,9 @@ def type_via_keystrokes(text, delay=0.005):
     honors direct AXValue writes, since from the app's point of view
     this looks identical to the user typing.
 
-    IMPORTANT: the target element must already be focused (see
-    focus_element()) before calling this — these events go to
-    whatever currently has keyboard focus, not to a specific element.
+    IMPORTANT: the target element must already be focused/clicked before
+    calling this -- these events go to whatever currently has keyboard
+    focus, not to a specific element.
     """
     for char in text:
         event_down = CGEventCreateKeyboardEvent(None, 0, True)
@@ -283,29 +359,46 @@ def type_via_keystrokes(text, delay=0.005):
         time.sleep(delay)
 
 
-def activate_app(pid):
+def select_all_and_delete():
     """
-    Bring the target app to the actual OS foreground. This is separate
-    from — and required in addition to — focus_element()'s AXFocused
-    attribute: AXFocused only sets accessibility focus *within* the app,
-    but CGEventPost keystrokes go to whatever app is frontmost at the OS
-    level. Skipping this step is how keystrokes end up typed into the
-    wrong window (e.g. your terminal) even when AXFocused succeeded.
+    Select all existing text in whatever field currently has keyboard
+    focus (Cmd+A) and delete it, so a subsequent type_via_keystrokes()
+    call REPLACES the field's contents instead of appending to them.
+
+    This is what was missing before: type_into_element_reliable() used
+    to type directly at the current cursor position, so calling it twice
+    (e.g. two separate phone commands against the same open note) would
+    concatenate text instead of overwriting it -- "Hi" + "hello" becoming
+    "Hihello" rather than "hello".
     """
-    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-    if app is None:
-        print(f"Warning: could not find running app for pid {pid}")
-        return False
-    return app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    down = CGEventCreateKeyboardEvent(None, _VK_A, True)
+    CGEventSetFlags(down, kCGEventFlagMaskCommand)
+    CGEventPost(kCGHIDEventTap, down)
+
+    up = CGEventCreateKeyboardEvent(None, _VK_A, False)
+    CGEventSetFlags(up, kCGEventFlagMaskCommand)
+    CGEventPost(kCGHIDEventTap, up)
+
+    time.sleep(0.05)
+
+    down = CGEventCreateKeyboardEvent(None, _VK_DELETE, True)
+    CGEventPost(kCGHIDEventTap, down)
+    up = CGEventCreateKeyboardEvent(None, _VK_DELETE, False)
+    CGEventPost(kCGHIDEventTap, up)
+
+    time.sleep(0.05)
 
 
-def type_into_element_reliable(element, text, verify=True, pid=None):
+def type_into_element_reliable(element, text, verify=True, pid=None, replace=True):
     """
-    Best-effort text entry: bring the app to the OS foreground, focus
-    the element, then type via simulated keystrokes. Optionally
-    re-reads AXValue afterward to confirm the text actually landed.
+    Best-effort text entry: bring the app to the OS foreground, click the
+    element to establish real focus, optionally clear any existing content
+    (replace=True, the default -- set False if you deliberately want to
+    append), then type via simulated keystrokes. Re-reads AXValue afterward
+    to confirm the text actually landed, since AX return codes alone aren't
+    trustworthy.
 
-    `pid` is required to correctly activate the target app — without it,
+    `pid` is required to correctly activate the target app -- without it,
     keystrokes may go to whatever window currently has real OS focus
     (e.g. your terminal) instead of the intended app.
     """
@@ -313,21 +406,29 @@ def type_into_element_reliable(element, text, verify=True, pid=None):
         activate_app(pid)
         time.sleep(0.4)  # give macOS time to actually switch foreground app
     else:
-        print("Warning: no pid provided — cannot guarantee the target app "
+        print("Warning: no pid provided -- cannot guarantee the target app "
               "is frontmost. Keystrokes may go to the wrong window.")
 
-    # Prefer a real click over AXFocused — some apps (e.g. Notes) accept
+    # Prefer a real click over AXFocused -- some apps (e.g. Notes) accept
     # clicks but silently ignore the accessibility focus attribute.
     if not click_element_directly(element):
         focus_element(element)  # fall back, better than nothing
 
     time.sleep(0.2)
+
+    if replace:
+        select_all_and_delete()
+
     type_via_keystrokes(text)
 
     if verify:
         time.sleep(0.2)
         new_value = get_attr(element, "AXValue") or ""
-        if text in str(new_value):
+        if replace:
+            matches = str(new_value) == text
+        else:
+            matches = text in str(new_value)
+        if matches:
             return True
         else:
             print(f"Warning: verification failed. AXValue now reads: {new_value!r}")
@@ -335,25 +436,11 @@ def type_into_element_reliable(element, text, verify=True, pid=None):
     return True
 
 
-def list_windows(pid, app_name):
-    """Debug helper: print every window AXTitle for the app, so you can
-    confirm which window get_main_window() should be picking up."""
-    app_element = AXUIElementCreateApplication(pid)
-    windows = get_attr(app_element, "AXWindows") or []
-    print(f"\n{app_name} has {len(windows)} window(s):")
-    for i, win in enumerate(windows):
-        title = get_attr(win, "AXTitle") or "(untitled)"
-        is_main = get_attr(win, "AXMain")
-        print(f"  [{i}] '{title}'{'  <- main' if is_main else ''}")
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--app", help="App name to inspect (default: frontmost app)")
     parser.add_argument("--no-filter", action="store_true",
-                         help="Show all elements, not just interactive/content roles")
-    parser.add_argument("--list-windows", action="store_true",
-                         help="Just list the app's windows and exit (debug helper)")
+                         help="Show all elements, not just INTERESTING_ROLES")
     args = parser.parse_args()
 
     if args.app:
@@ -363,10 +450,6 @@ def main():
             sys.exit(1)
     else:
         pid, name = get_frontmost_pid()
-
-    if args.list_windows:
-        list_windows(pid, name)
-        return
 
     dump_ui_tree(pid, name, filter_roles=not args.no_filter)
 
